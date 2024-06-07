@@ -1,49 +1,125 @@
-from flask import Flask, request
-import pandas as pd
-from sklearn.model_selection import train_test_split
-from sklearn.feature_extraction.text import CountVectorizer
-from sklearn.naive_bayes import MultinomialNB
-from sklearn.pipeline import Pipeline
-import re
-import string
-import numpy as np
+import os
+import hashlib
+import time
+from flask import Flask, request, jsonify
+import requests
 
 app = Flask(__name__)
 
-# Load the data for training
-data = pd.read_csv('sms_3.csv')
+API_KEY = os.getenv("VIRUSTOTAL_API_KEY")
 
-# Fill missing values with an empty string
-data['Message'] = data['Message'].fillna('')
+def get_file_hash(file_path):
+    sha256_hash = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        for byte_block in iter(lambda: f.read(4096), b""):
+            sha256_hash.update(byte_block)
+    return sha256_hash.hexdigest()
 
-data['Spam'] = data['Category'].apply(lambda x: 1 if x == 'spam' else 0)
+def upload_file_to_virustotal(file_path):
+    url = "https://www.virustotal.com/vtapi/v2/file/scan"
+    file_hash = get_file_hash(file_path)
+    params = {
+        "apikey": API_KEY
+    }
+    files = {
+        "file": (file_hash, open(file_path, "rb"))
+    }
+    response = requests.post(url, files=files, params=params)
+    return response.json()
 
-X_train, X_test, y_train, y_test = train_test_split(data.Message, data.Spam, test_size=0.25)
+def get_file_report(scan_id):
+    url = f"https://www.virustotal.com/vtapi/v2/file/report"
+    params = {
+        "apikey": API_KEY,
+        "resource": scan_id
+    }
+    response = requests.get(url, params=params)
+    return response.json()
 
-# Create a pipeline with CountVectorizer and MultinomialNB
-clf = Pipeline([
-    ('vectorizer', CountVectorizer()),
-    ('nb', MultinomialNB())
-])
+def scan_url_with_virustotal(url_to_scan):
+    url = "https://www.virustotal.com/vtapi/v2/url/scan"
+    params = {
+        "apikey": API_KEY,
+        "url": url_to_scan
+    }
+    response = requests.post(url, data=params)
+    return response.json()
 
-# Training the model
-clf.fit(X_train, y_train)
+def get_url_report(scan_id):
+    url = f"https://www.virustotal.com/vtapi/v2/url/report"
+    params = {
+        "apikey": API_KEY,
+        "resource": scan_id
+    }
+    response = requests.get(url, params=params)
+    return response.json()
 
-def preprocess_text(text):
-    text = text.translate(str.maketrans('', '', string.punctuation)).lower()
-    text = re.sub(r'\W+', ' ', text)
-    return text
+@app.route('/scan_file', methods=['POST'])
+def scan_file():
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file part in the request'}), 400
 
-@app.route('/predict_spam', methods=['POST'])
-def predict_spam():
-    text = request.form['text']
-    processed_text = preprocess_text(text)
-    prediction = clf.predict([processed_text])[0]
-    if prediction == 0:
-        result = 'Ham (Not Spam)'
-    else:
-        result = 'Spam'
-    return result
+    file = request.files['file']
+    file_path = os.path.join('/tmp', file.filename)
+    file.save(file_path)
+
+    response = upload_file_to_virustotal(file_path)
+    if response["response_code"] == 1:
+        scan_id = response["scan_id"]
+        while True:
+            report = get_file_report(scan_id)
+            if report["response_code"] == 1:
+                positives = report["positives"]
+                total = report["total"]
+                malware_ratio = positives / total
+
+                if malware_ratio > 0.5:
+                    result = "File is likely malware."
+                else:
+                    result = "File is likely not malware."
+
+                return jsonify({
+                    'result': result,
+                    'detection_ratio': f"{malware_ratio:.2f} ({positives}/{total})"
+                })
+            elif report["response_code"] == -2:
+                time.sleep(60)
+            else:
+                return jsonify({'error': report["verbose_msg"]}), 400
+
+    return jsonify({'error': response["verbose_msg"]}), 400
+
+@app.route('/scan_url', methods=['POST'])
+def scan_url():
+    data = request.get_json()
+    url_to_scan = data.get('url')
+    if not url_to_scan:
+        return jsonify({'error': 'No URL provided'}), 400
+
+    response = scan_url_with_virustotal(url_to_scan)
+    if response["response_code"] == 1:
+        scan_id = response["scan_id"]
+        while True:
+            report = get_url_report(scan_id)
+            if report["response_code"] == 1:
+                positives = report["positives"]
+                total = report["total"]
+                if positives > 0:
+                    result = "URL is likely malicious."
+                else:
+                    result = "URL is likely safe."
+
+                return jsonify({
+                    'result': result,
+                    'detection_ratio': f"{positives}/{total}"
+                })
+            elif report["response_code"] == -2:
+                time.sleep(60)
+            else:
+                return jsonify({'error': report["verbose_msg"]}), 400
+
+    return jsonify({'error': response["verbose_msg"]}), 400
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+    app.run(debug=True)
+
